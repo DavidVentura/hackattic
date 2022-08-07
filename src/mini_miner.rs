@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Debug)]
 struct Block {
+    #[allow(dead_code)]
     nonce: Option<()>,
     data: Vec<(String, i32)>,
 }
