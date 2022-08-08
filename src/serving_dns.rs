@@ -1,7 +1,9 @@
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
+use serde_json::json;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
+use std::time::Instant;
 use std::{error::Error, net::UdpSocket};
 
 use serde::Deserialize;
@@ -27,6 +29,7 @@ enum QuestionClass {
 #[derive(FromPrimitive, Debug, Clone, Copy, PartialEq)]
 enum QuestionType {
     A = 1,
+    CNAME = 5,
     AAAA = 28,
     RP = 17,
     TXT = 16,
@@ -87,7 +90,6 @@ impl Flags {
             (r as u16);
         // z is also 0
         let res = v.to_be_bytes().to_vec();
-        println!("reply flags {:b} {:b}", res[0], res[1]);
         res
     }
 }
@@ -227,7 +229,10 @@ impl Answer {
     }
 }
 
-pub fn solve(parsed_data: String) -> Result<String, Box<dyn Error>> {
+pub fn solve<F>(parsed_data: String, cb: F) -> Result<String, Box<dyn Error>>
+where
+    F: FnOnce(&'_ str),
+{
     let mut answers: Vec<Answer> = vec![];
     let json_data: ProblemData = serde_json::from_str(&parsed_data)?;
 
@@ -268,25 +273,29 @@ pub fn solve(parsed_data: String) -> Result<String, Box<dyn Error>> {
     }
 
     let socket = UdpSocket::bind("0.0.0.0:15353")?;
+    cb(json!({"dns_ip": "78.46.233.60", "dns_port": 15353i32})
+        .to_string()
+        .as_ref());
     loop {
         let mut buf = [0; 1440];
         let (_, addr) = socket.recv_from(&mut buf)?;
+        let start = Instant::now();
         //println!("{:?}", &addr);
         //println!("{:?} {}", &buf[..len], len);
         let message = Message::from_bytes(&buf[..12]);
         //println!("{:?}", message);
         assert_eq!(message.question_len, 1);
         let q = Question::from_bytes(&mut buf[12..]);
-        println!("{:?}", q);
+        // println!("{:?}", q);
 
         let mut found = false;
         for a in &answers {
             if a.name != q.domain && (!a.glob || !q.domain.ends_with(a.name.as_str())) {
-                println!("Request domain {} is not {}", q.domain, a.name);
+                // println!("Request domain {} is not {}", q.domain, a.name);
                 continue;
             }
             if a.atype != q.qtype {
-                println!("Request type {:?} is not {:?}", q.qtype, a.atype);
+                // println!("Request type {:?} is not {:?}", q.qtype, a.atype);
                 continue;
             }
             socket.send_to(&a.to_bytes(&message, &q, ResponseCode::NoError), addr)?;
@@ -308,16 +317,6 @@ pub fn solve(parsed_data: String) -> Result<String, Box<dyn Error>> {
                 addr,
             )?;
         }
-        /*
-        let data = Answer {
-            name: q.domain.clone(),
-            atype: q.qtype,
-            class: q.class,
-            ttl: 1200,
-            data: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
-            //data: vec![142, 251, 36, 46],
-        };
-        //println!("{:?}", data);
-        */
+        println!("Took {:?} to send", Instant::now() - start);
     }
 }

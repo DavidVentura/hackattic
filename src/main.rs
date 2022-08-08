@@ -31,13 +31,25 @@ fn main() {
         "mini_miner" => mini_miner::solve(parsed_data),
         //"brute_force_zip" => brute_force_zip::solve(parsed_data),
         "backup_restore" => backup_restore::solve(parsed_data),
-        "serving_dns" => serving_dns::solve(parsed_data),
+        "serving_dns" => serving_dns::solve(parsed_data, |res| {
+            println!("Posting {:?}", res);
+            println!(
+                "Got {:?}",
+                submit_result(solve_problem_url.as_ref(), res)
+                    .unwrap()
+                    .into_string()
+            );
+        }),
         _ => panic!(),
     }
     .unwrap();
 
-    let submission_result = ureq::post(&solve_problem_url)
-        .set("Content-Type", "application/json")
-        .send_string(&res);
+    let submission_result = submit_result(solve_problem_url.as_ref(), &res);
     println!("{:?}", submission_result.unwrap().into_string());
+}
+
+fn submit_result(url: &'_ str, res: &'_ str) -> Result<ureq::Response, ureq::Error> {
+    ureq::post(url)
+        .set("Content-Type", "application/json")
+        .send_string(&res)
 }
