@@ -17,7 +17,7 @@ struct ProblemData {
 
 #[derive(Debug)]
 struct AuxHeader {
-    entries: Vec<RedisValues>,
+    entries: Vec<KVPair>,
 }
 
 #[derive(Debug)]
@@ -29,12 +29,19 @@ struct Snapshot {
 #[derive(Debug)]
 struct Database {
     id: u8,
-    entries: Vec<RedisValues>,
+    entries: Vec<KVPair>,
     expiries: Vec<u32>,
 }
 
 #[derive(Debug)]
-enum RedisValues {
+enum RedisValue {
+    STR(String),
+    U8(u8),
+    U32(u32),
+}
+
+#[derive(Debug)]
+enum KVPair {
     STR(String, String),
     U8(String, u8),
     U32(String, u32),
@@ -44,61 +51,91 @@ enum RedisValues {
 #[repr(u8)]
 enum OpCodes {
     Aux = 0xFA,
-    SelectDB = 0xFE,
     ResizeDB = 0xFB,
+    ExpireTimeMs = 0xFC,
+    ExpireTimeSec = 0xFD,
+    SelectDB = 0xFE,
+    EOF = 0xFF,
 }
-const RDB_ENCVAL: u8 = 0x3;
 
-const RDB_6BITLEN: u8 = 0x0;
-const RDB_14BITLEN: u8 = 0x1;
+#[derive(IntoPrimitive, TryFromPrimitive)]
+#[repr(u8)]
+enum LengthEnc {
+    SixBits = 0x0,
+    FourteenBits = 0x1,
+    FourOrEightBytes = 0x2,
+    Encoded = 0x3,
+}
 
-const RDB_ENC_INT8: u8 = 0x0;
-const RDB_ENC_INT16: u8 = 0x1;
-const RDB_ENC_INT32: u8 = 0x2;
+#[derive(IntoPrimitive, TryFromPrimitive)]
+#[repr(u8)]
+enum SpecialEncoding {
+    INT8 = 0x0,
+    INT16 = 0x1,
+    INT32 = 0x2,
+}
 
-fn read_key_value<I>(buf: &mut Peekable<I>) -> RedisValues
+fn read_length_encoding<I>(buf: &mut Peekable<I>) -> RedisValue
+where
+    I: Iterator<Item = u8>,
+{
+    let first_2_bits = (buf.peek().unwrap() & 0xC0) >> 6;
+    let last_6_bits = buf.next().unwrap() & 0x3F;
+    let enc = LengthEnc::try_from_primitive(first_2_bits).unwrap();
+    match enc {
+        LengthEnc::Encoded => {
+            let len = SpecialEncoding::try_from_primitive(last_6_bits).unwrap();
+            match len {
+                SpecialEncoding::INT8 => RedisValue::U8(buf.next().unwrap()),
+                SpecialEncoding::INT16 => panic!(),
+                SpecialEncoding::INT32 => {
+                    let bytes: Vec<u8> = buf.take(4).collect();
+                    assert_eq!(bytes.len(), 4);
+                    RedisValue::U32(u32::from_le_bytes(bytes.try_into().unwrap()))
+                }
+            }
+        }
+        LengthEnc::SixBits => {
+            let len = last_6_bits;
+            // FIXME: stringy bit
+            let val = String::from_utf8(buf.take(len as usize).collect()).unwrap();
+            RedisValue::STR(val)
+        }
+        LengthEnc::FourteenBits => {
+            // stringy ?
+            let val_len = ((last_6_bits as u32) << 8) | buf.next().unwrap() as u32;
+            println!("val len {}", val_len);
+            let val = String::from_utf8(buf.take(val_len as usize).collect()).unwrap();
+            RedisValue::STR(val)
+        }
+        LengthEnc::FourOrEightBytes => {
+            let len_discriminator = buf.next().unwrap();
+            if len_discriminator == 0 {
+                // 32 bit, "net order"
+                let bytes: Vec<u8> = buf.take(4).collect();
+                RedisValue::U32(u32::from_be_bytes(bytes.try_into().unwrap()))
+            } else {
+                // 64 bit, "net order"
+                assert_eq!(len_discriminator, 1);
+                panic!();
+                // RedisValue::U64(u64::from_be(bytes))
+            }
+        }
+    }
+}
+
+fn read_key_value<I>(buf: &mut Peekable<I>) -> KVPair
 where
     I: Iterator<Item = u8>,
 {
     let key_len = buf.next().unwrap();
     let key = String::from_utf8(buf.take(key_len as usize).collect()).unwrap();
-    // println!("key {}", key);
-    let hint = (buf.peek().unwrap() & 0xC0) >> 6;
-    // println!("peek {} hint {}", buf.peek().unwrap(), hint);
-    match hint {
-        RDB_ENCVAL => {
-            let len = buf.next().unwrap() & 0x3F; // last 6 bits
-                                                  // isencoded now
-            match len {
-                RDB_ENC_INT8 => RedisValues::U8(key, buf.next().unwrap()),
-                RDB_ENC_INT16 => panic!(),
-                RDB_ENC_INT32 => {
-                    let bytes: Vec<u8> = buf.take(4).collect();
-                    assert_eq!(bytes.len(), 4);
-                    RedisValues::U32(
-                        key,
-                        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-                    )
-                }
-                _ => panic!(),
-            }
-        }
-        RDB_6BITLEN => {
-            let len = buf.next().unwrap() & 0x3F; // last 6 bits
-                                                  // RedisValues::U8(buf.next().unwrap())
-                                                  // FIXME: stringy bit
-            let val = String::from_utf8(buf.take(len as usize).collect()).unwrap();
-            RedisValues::STR(key, val)
-        }
-        RDB_14BITLEN => {
-            // stringy ?
-            let val_len = (((buf.next().unwrap() & 0x3F) as u32) << 8) | buf.next().unwrap() as u32;
-            println!("val len {}", val_len);
-            let val = String::from_utf8(buf.take(val_len as usize).collect()).unwrap();
-            RedisValues::STR(key, val)
-        }
-        _ => panic!(),
+    match read_length_encoding(buf) {
+        RedisValue::STR(v) => KVPair::STR(key, v),
+        RedisValue::U8(v) => KVPair::U8(key, v),
+        RedisValue::U32(v) => KVPair::U32(key, v),
     }
+    // println!("key {}", key);
 }
 
 impl AuxHeader {
