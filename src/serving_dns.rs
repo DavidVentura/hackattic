@@ -3,6 +3,7 @@ use num_traits::FromPrimitive;
 use serde_json::json;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
+use std::thread;
 use std::time::Instant;
 use std::{error::Error, net::UdpSocket};
 
@@ -59,13 +60,18 @@ enum ResponseCode {
 
 #[derive(Debug, Clone, Copy)]
 struct Flags {
+    #[allow(dead_code)]
     query_type: QueryType, // query (0) || reply (1)
-    opcode: Opcode,        // query (0) || iquery (1) || status (2)
+    opcode: Opcode, // query (0) || iquery (1) || status (2)
     // authoritative_answer: bool,
+    #[allow(dead_code)]
     truncated: bool,
     recursion_desired: bool,
+    #[allow(dead_code)]
     ad_bit: bool,
+    #[allow(dead_code)]
     unauthenticated_ok: bool,
+    #[allow(dead_code)]
     response_code: ResponseCode,
 }
 
@@ -100,7 +106,9 @@ struct Message {
     flags: Flags,
     question_len: u16,
     answer_len: u16,
+    #[allow(dead_code)]
     auth_rr_len: u16,
+    #[allow(dead_code)]
     additional_rr_len: u16,
 }
 
@@ -121,10 +129,10 @@ impl Message {
         response.append(&mut self.flags.to_bytes(r));
         response.append(&mut self.question_len.to_be_bytes().to_vec());
         response.append(&mut self.answer_len.to_be_bytes().to_vec());
-        response.push(0); // authority rr
-        response.push(0); // authority rr
-        response.push(0); // additional rr
-        response.push(1); // additional rr
+        response.push(0);
+        response.push(self.auth_rr_len as u8);
+        response.push(0);
+        response.push(self.additional_rr_len as u8);
         response
     }
 }
@@ -165,7 +173,8 @@ impl Question {
         buf = &mut buf[1..];
         let qtype = QuestionType::from_u16(u16::from_be_bytes([buf[0], buf[1]])).unwrap();
         let class = QuestionClass::from_u16(u16::from_be_bytes([buf[2], buf[3]])).unwrap();
-        buf = &mut buf[4..];
+        // FIXME: should run this but doesn't mutate outside buffer
+        // buf = &mut buf[4..];
 
         Question {
             domain: labels.join("."),
@@ -229,10 +238,7 @@ impl Answer {
     }
 }
 
-pub fn solve<F>(parsed_data: String, cb: F) -> Result<String, Box<dyn Error>>
-where
-    F: FnOnce(&'_ str),
-{
+pub fn solve(parsed_data: String, url: String) -> Result<String, Box<dyn Error>> {
     let mut answers: Vec<Answer> = vec![];
     let json_data: ProblemData = serde_json::from_str(&parsed_data)?;
 
@@ -273,16 +279,25 @@ where
     }
 
     let socket = UdpSocket::bind("0.0.0.0:15353")?;
-    cb(json!({"dns_ip": "78.46.233.60", "dns_port": 15353i32})
-        .to_string()
-        .as_ref());
+    let handler = thread::spawn(move || {
+        let r = crate::submit_result(
+            url.as_ref(),
+            json!({"dns_ip": "78.46.233.60", "dns_port": 15353u32})
+                .to_string()
+                .as_ref(),
+        );
+        println!("{:?}", r.unwrap().into_string());
+    });
     loop {
+        println!("Waiting for DNS req..");
         let mut buf = [0; 1440];
         let (_, addr) = socket.recv_from(&mut buf)?;
         let start = Instant::now();
         //println!("{:?}", &addr);
         //println!("{:?} {}", &buf[..len], len);
-        let message = Message::from_bytes(&buf[..12]);
+        let mut message = Message::from_bytes(&buf[..12]);
+        message.additional_rr_len = 0;
+        message.answer_len = 1;
         //println!("{:?}", message);
         assert_eq!(message.question_len, 1);
         let q = Question::from_bytes(&mut buf[12..]);
