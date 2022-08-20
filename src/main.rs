@@ -1,5 +1,6 @@
 mod backup_restore;
 mod brute_force_zip;
+mod collision;
 mod help_me_unpack;
 mod mini_miner;
 mod redis;
@@ -11,7 +12,8 @@ fn main() {
     let token = env::var("HACKATTIC_TOKEN")
         .expect("Expected a token on environment variable HACKATTIC_TOKEN");
     // let problem_name = "the_redis_one";
-    let problem_name = "the_redis_one";
+    //let problem_name = "serving_dns";
+    let problem_name = "collision_course";
 
     let problem_url = format!(
         "https://hackattic.com/challenges/{}/problem?access_token={}",
@@ -35,6 +37,7 @@ fn main() {
         "backup_restore" => backup_restore::solve(parsed_data),
         "serving_dns" => serving_dns::solve(parsed_data, solve_problem_url.clone()),
         "the_redis_one" => redis::solve(parsed_data),
+        "collision_course" => collision::solve(parsed_data),
         _ => panic!(),
     }
     .unwrap();
