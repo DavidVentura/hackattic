@@ -1,7 +1,10 @@
 use num_enum::{IntoPrimitive, TryFromPrimitive};
+use regex::Regex;
+use serde_json::json;
 use std::error::Error;
 use std::fs;
 use std::iter::Peekable;
+use std::time::SystemTime;
 
 use serde::Deserialize;
 
@@ -27,14 +30,21 @@ struct Snapshot {
     dbs: Vec<Database>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Database {
     id: u8,
     entries: Vec<KVPair>,
-    expiries: Vec<u32>,
+    expiries: Vec<u64>,
 }
 
 #[derive(Debug)]
+enum Value {
+    Raw(u32),
+    Encoded(u32),
+    U32(u32),
+}
+
+#[derive(Debug, Clone)]
 enum RedisValue {
     STR(String),
     U8(u8),
@@ -43,16 +53,21 @@ enum RedisValue {
     U32(u32),
     I32(i32),
     I64(i64),
-    UNKNOWN_TYPE(u32),
 }
 
-#[derive(Debug)]
-enum KVPair {
-    STR(String, String),
-    U8(String, u8),
-    U16(String, u16),
-    U32(String, u32),
-    LIST(String, Vec<RedisValue>),
+#[derive(Debug, Clone)]
+struct KVPair {
+    key: String,
+    val: KVVal,
+}
+
+#[derive(Debug, Clone)]
+enum KVVal {
+    STR(String),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    LIST(Vec<RedisValue>),
 }
 
 #[derive(IntoPrimitive, TryFromPrimitive, PartialEq, Debug)]
@@ -88,6 +103,10 @@ enum SpecialEncoding {
 #[repr(u8)]
 enum ValueTypeEncoding {
     STR = 0,
+    /*
+     * Ziplist = 10,
+     * Intset = 11,
+     */
     HashmapZe = 13,
 }
 
@@ -159,7 +178,7 @@ fn parse_ziplist_encoding<I>(buf: &mut Peekable<I>) -> Vec<RedisValue>
 where
     I: Iterator<Item = u8>,
 {
-    let ziplist_len = read_length_encoding(buf);
+    let ziplist_len = read_length(buf);
 
     let _bytes: Vec<u8> = buf.take(4).collect();
     let _zlbytes = u32::from_le_bytes(_bytes.try_into().unwrap());
@@ -170,7 +189,7 @@ where
     let _bytes: Vec<u8> = buf.take(2).collect();
     let _zllen = u16::from_le_bytes(_bytes.try_into().unwrap());
 
-    println!("{}", _zllen);
+    println!("zl len {}", _zllen);
     let ret = (0.._zllen).map(|_| parse_zl_entry(buf)).collect();
     assert_eq!(buf.next().unwrap(), 0xFF); // end of ziplist
 
@@ -182,28 +201,35 @@ where
     I: Iterator<Item = u8>,
 {
     let _v = buf.next().unwrap();
-    let key_len = match read_length_encoding(buf) {
-        RedisValue::UNKNOWN_TYPE(len) => len,
-        _ => panic!(),
+    let l = read_length(buf);
+
+    let key_len = match l {
+        Value::Raw(len) => len as u32,
+        Value::U32(len) => len as u32,
+        v => panic!("not sure what {:?} is", v),
     };
-    let key = String::from_utf8(buf.take(key_len as usize).collect()).unwrap();
-    println!("got key from valuetype {}", key);
+    let _keybuf: Vec<u8> = buf.take(key_len as usize).collect();
+    let key = if let Ok(_key) = String::from_utf8(_keybuf.clone()) {
+        _key.to_string()
+    } else {
+        format!("<<<<key is invalid string {:?}>>>>", _keybuf)
+    };
 
     let val_type = ValueTypeEncoding::try_from_primitive(_v).unwrap();
-    match val_type {
-        ValueTypeEncoding::STR => match read_length_encoding(buf) {
-            RedisValue::UNKNOWN_TYPE(len) => KVPair::STR(
-                key,
-                String::from_utf8(buf.take(len as usize).collect()).unwrap(),
-            ),
-            RedisValue::U16(len) => KVPair::U16(key, len),
-            _ => panic!(),
+    KVPair {
+        key,
+        val: match val_type {
+            ValueTypeEncoding::STR => match read_length_encoding(buf) {
+                RedisValue::STR(s) => KVVal::STR(s),
+                RedisValue::U16(len) => KVVal::U16(len),
+                v => panic!("RV {:#?}", v),
+            },
+            ValueTypeEncoding::HashmapZe => KVVal::LIST(parse_ziplist_encoding(buf)),
         },
-        ValueTypeEncoding::HashmapZe => KVPair::LIST(key, parse_ziplist_encoding(buf)),
     }
 }
 
-fn read_length_encoding<I>(buf: &mut Peekable<I>) -> RedisValue
+fn read_length<I>(buf: &mut Peekable<I>) -> Value
 where
     I: Iterator<Item = u8>,
 {
@@ -211,8 +237,36 @@ where
     let last_6_bits = buf.next().unwrap() & 0x3F;
     let len = LengthEnc::try_from_primitive(first_2_bits).unwrap();
     match len {
-        LengthEnc::Encoded => {
-            let enc = SpecialEncoding::try_from_primitive(last_6_bits).unwrap();
+        LengthEnc::Encoded => Value::Encoded(last_6_bits as u32),
+
+        LengthEnc::SixBits => Value::Raw(last_6_bits as u32),
+
+        LengthEnc::FourteenBits => {
+            Value::Raw(((last_6_bits as u32) << 8) | buf.next().unwrap() as u32)
+        }
+        LengthEnc::FourOrEightBytes => {
+            let len_discriminator = buf.next().unwrap();
+            if len_discriminator == 0 {
+                // 32 bit, "net order"
+                let bytes: Vec<u8> = buf.take(4).collect();
+                Value::U32(u32::from_be_bytes(bytes.try_into().unwrap()))
+                //RedisValue::U32(u32::from_be_bytes(bytes.try_into().unwrap()))
+            } else {
+                // 64 bit, "net order"
+                assert_eq!(len_discriminator, 1);
+                panic!();
+                // RedisValue::U64(u64::from_be(bytes))
+            }
+        }
+    }
+}
+fn read_length_encoding<I>(buf: &mut Peekable<I>) -> RedisValue
+where
+    I: Iterator<Item = u8>,
+{
+    match read_length(buf) {
+        Value::Encoded(last_6_bits) => {
+            let enc = SpecialEncoding::try_from_primitive(last_6_bits as u8).unwrap();
             match enc {
                 SpecialEncoding::INT8 => RedisValue::U8(buf.next().unwrap()),
                 SpecialEncoding::INT16 => {
@@ -228,49 +282,10 @@ where
                 SpecialEncoding::Compressed => panic!(),
             }
         }
-        LengthEnc::SixBits => {
-            //panic!();
-            let len = last_6_bits;
-            // FIXME: how to decide the type? i assume it's always STR otherwise it'd use the
-            // special encoding
-            println!("reading 6bit encoding: {}", len);
-            RedisValue::UNKNOWN_TYPE(len as u32)
+        Value::Raw(bytes) => {
+            RedisValue::STR(String::from_utf8(buf.take(bytes as usize).collect()).unwrap())
         }
-        LengthEnc::FourteenBits => {
-            // stringy ?
-            let val_len = ((last_6_bits as u16) << 8) | buf.next().unwrap() as u16;
-            println!("14bit val len {}", val_len);
-            //let val = String::from_utf8(buf.take(val_len as usize).collect()).unwrap();
-            //RedisValue::STR(val)
-            RedisValue::U16(val_len)
-        }
-        LengthEnc::FourOrEightBytes => {
-            let len_discriminator = buf.next().unwrap();
-            if len_discriminator == 0 {
-                // 32 bit, "net order"
-                let bytes: Vec<u8> = buf.take(4).collect();
-                RedisValue::U32(u32::from_be_bytes(bytes.try_into().unwrap()))
-            } else {
-                // 64 bit, "net order"
-                assert_eq!(len_discriminator, 1);
-                panic!();
-                // RedisValue::U64(u64::from_be(bytes))
-            }
-        }
-    }
-}
-
-fn read_u32_le<I>(buf: &mut Peekable<I>, len: u32) -> u32
-where
-    I: Iterator<Item = u8>,
-{
-    let bytes: Vec<u8> = buf.take(len as usize).collect();
-    match len {
-        0 => 0u32,
-        1 => bytes[0] as u32,
-        2 => u16::from_le_bytes(bytes.try_into().unwrap()) as u32,
-        4 => u32::from_le_bytes(bytes.try_into().unwrap()),
-        v => panic!("unsure how to read u32 of len {}", v),
+        Value::U32(num) => RedisValue::U32(num),
     }
 }
 
@@ -280,16 +295,15 @@ where
 {
     let key_len = buf.next().unwrap();
     let key = String::from_utf8(buf.take(key_len as usize).collect()).unwrap();
-    match read_length_encoding(buf) {
-        RedisValue::STR(v) => KVPair::STR(key, v),
-        RedisValue::U8(v) => KVPair::U8(key, v),
-        RedisValue::U16(v) => KVPair::U16(key, v),
-        RedisValue::U32(v) => KVPair::U32(key, v),
-        RedisValue::UNKNOWN_TYPE(len) => {
-            let val = String::from_utf8(buf.take(len as usize).collect()).unwrap();
-            KVPair::STR(key, val)
-        }
-        _ => panic!(),
+    KVPair {
+        key,
+        val: match read_length_encoding(buf) {
+            RedisValue::STR(v) => KVVal::STR(v),
+            RedisValue::U8(v) => KVVal::U8(v),
+            RedisValue::U16(v) => KVVal::U16(v),
+            RedisValue::U32(v) => KVVal::U32(v),
+            _ => panic!(),
+        },
     }
 }
 
@@ -324,47 +338,59 @@ impl Database {
             return None;
         }
         buf.next(); // consume opcode
-        println!("fetching DB id");
         let db_id = buf.next().unwrap();
-        println!("db id {}", db_id);
 
         assert_eq!(
             OpCodes::try_from(buf.next().unwrap()).unwrap(),
             OpCodes::ResizeDB
         );
-        let hash_size = if let RedisValue::UNKNOWN_TYPE(len) = read_length_encoding(buf) {
+        let hash_size = if let Value::Raw(len) = read_length(buf) {
             len
         } else {
-            999
+            panic!();
         };
-        let expire_size = if let RedisValue::UNKNOWN_TYPE(len) = read_length_encoding(buf) {
+        let expire_size = if let Value::Raw(len) = read_length(buf) {
             len
         } else {
-            999
+            panic!();
         };
 
-        println!("hash {:?} expire {:?}", hash_size, expire_size);
         let mut entries: Vec<KVPair> = Vec::with_capacity(hash_size as usize);
+        let mut expiries: Vec<u64> = Vec::with_capacity(expire_size as usize);
+        let mut last_expiry: u64 = 0;
         loop {
-            match OpCodes::try_from(*buf.peek().unwrap()) {
-                Ok(OpCodes::SelectDB) => break,  // DB ends on SelectDB
-                Ok(OpCodes::EOF) => return None, // File ends on SelectDB
-                Ok(_) => panic!(),
-                Err(_) => entries.push(read_value_type(buf)),
+            let opcode = *buf.peek().unwrap();
+            match OpCodes::try_from(opcode) {
+                Ok(OpCodes::SelectDB) => break, // DB ends on SelectDB
+                Ok(OpCodes::EOF) => break,      // File ends on SelectDB
+                Ok(OpCodes::ExpireTimeMs) => {
+                    buf.next().unwrap(); // consume opcode
+                    let data: Vec<u8> = buf.take(8).collect();
+                    let expiry_ms = u64::from_le_bytes(data.try_into().unwrap());
+                    last_expiry = expiry_ms;
+                }
+                Ok(unkn) => panic!("Unknown OpCode {:#?}", unkn),
+                Err(_) if opcode < 245 => {
+                    let e = read_value_type(buf);
+                    expiries.push(last_expiry);
+                    last_expiry = 0;
+                    entries.push(e);
+                }
+                Err(_) => panic!("Unknown OpCode {:#?}", opcode),
             }
         }
+        assert_eq!(entries.len() as u32, hash_size);
         Some(Database {
             id: db_id,
             entries,
-            expiries: vec![],
+            expiries: expiries,
         })
     }
 }
 pub fn solve(parsed_data: String) -> Result<String, Box<dyn Error>> {
-    /*
     let json_data: ProblemData = serde_json::from_str(&parsed_data)?;
     let mut rdb = base64::decode(json_data.rdb).unwrap();
-    let _ = json_data.requirements.check_type_of;
+    let key_to_check = json_data.requirements.check_type_of;
 
     rdb[0] = b'R';
     rdb[1] = b'E';
@@ -372,24 +398,72 @@ pub fn solve(parsed_data: String) -> Result<String, Box<dyn Error>> {
     rdb[3] = b'I';
     rdb[4] = b'S';
 
+    fs::write(
+        format!(
+            "db-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs()
+        ),
+        rdb.clone(),
+    )?;
+    /*
     assert!(rdb.starts_with("REDIS".as_bytes()));
-    */
     let rdb = fs::read("snap")?[9..].to_vec();
-    let mut buf = rdb.into_iter().peekable();
-    //buf.take(9); // header
+    */
+    let buf = &mut rdb.into_iter().peekable();
+    let _: Vec<u8> = buf.take(9).collect(); // header
 
-    let header = AuxHeader::parse(&mut buf);
+    let header = AuxHeader::parse(buf);
     let mut dbs = vec![];
-    for _ in 0..4 {
-        if let Some(d) = Database::parse(&mut buf) {
-            dbs.push(d);
-        }
+    while let Some(d) = Database::parse(buf) {
+        dbs.push(d);
     }
 
     let s = Snapshot {
         header: header.unwrap(),
-        dbs,
+        dbs: dbs.clone(),
     };
     println!("{:#?}", s);
-    Err("asd".into())
+
+    let db_count = dbs.len();
+    let mut emoji_key_value: String = "???".to_string();
+    let mut expiry_millis = 0;
+    let mut type_of_key_to_check = "type of key to check";
+
+    let emoji_regex = Regex::new(r"\p{Emoji}").unwrap();
+
+    println!("need to check type of {}", key_to_check);
+    for db in dbs {
+        for expiry in db.expiries {
+            if expiry > 0 {
+                assert_eq!(expiry_millis, 0);
+                expiry_millis = expiry;
+            }
+        }
+        for entry in db.entries {
+            if emoji_regex.is_match(&entry.key) {
+                println!("This key is emoji: {} {:?}", entry.key, entry.val);
+                if let KVVal::STR(s) = entry.val.clone() {
+                    emoji_key_value = s;
+                } else {
+                    panic!("idk how to store non-string val");
+                }
+            }
+
+            if entry.key == key_to_check {
+                type_of_key_to_check = match entry.val {
+                    KVVal::U8(val) => "number",
+                    KVVal::U16(val) => "number",
+                    KVVal::U32(val) => "number",
+                    KVVal::STR(val) => "string",
+                    KVVal::LIST(val) => "hash",
+                }
+            }
+        }
+    }
+
+    let res = json!({"db_count": db_count, "emoji_key_value": emoji_key_value, "expiry_millis": expiry_millis, key_to_check: type_of_key_to_check}).to_string();
+    println!("Submitting {}", res);
+    Ok(res)
 }
