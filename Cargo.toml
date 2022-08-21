@@ -18,3 +18,5 @@ byteorder = "1.4.3"
 num_enum = "0.5.7"
 regex = "1.6.0"
 md5 = "0.7.0"
+tungstenite = {version="0.17.3", features=["native-tls-vendored"]}
+url = "2.1.0"
