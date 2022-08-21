@@ -1,9 +1,9 @@
+// https://datatracker.ietf.org/doc/html/rfc1034
+// https://datatracker.ietf.org/doc/html/rfc1034
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
-use serde_json::json;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
-use std::thread;
 use std::time::Instant;
 use std::{error::Error, net::UdpSocket};
 
@@ -279,6 +279,7 @@ pub fn solve(parsed_data: String, url: String) -> Result<String, Box<dyn Error>>
     }
 
     let socket = UdpSocket::bind("0.0.0.0:15353")?;
+    /*
     let handler = thread::spawn(move || {
         let r = crate::submit_result(
             url.as_ref(),
@@ -288,6 +289,7 @@ pub fn solve(parsed_data: String, url: String) -> Result<String, Box<dyn Error>>
         );
         println!("{:?}", r.unwrap().into_string());
     });
+    */
     loop {
         println!("Waiting for DNS req..");
         let mut buf = [0; 1440];
@@ -313,7 +315,11 @@ pub fn solve(parsed_data: String, url: String) -> Result<String, Box<dyn Error>>
                 // println!("Request type {:?} is not {:?}", q.qtype, a.atype);
                 continue;
             }
+            let to_calc = Instant::now().duration_since(start);
             socket.send_to(&a.to_bytes(&message, &q, ResponseCode::NoError), addr)?;
+            let to_send = Instant::now().duration_since(start) - to_calc;
+            println!("Took {:?} to calculate", to_calc);
+            println!("Took {:?} to send", to_send);
             found = true;
             break;
         }
@@ -332,6 +338,5 @@ pub fn solve(parsed_data: String, url: String) -> Result<String, Box<dyn Error>>
                 addr,
             )?;
         }
-        println!("Took {:?} to send", Instant::now() - start);
     }
 }

@@ -9,6 +9,7 @@ struct ProblemData {
     include: String,
 }
 
+//https://github.com/corkami/collisions#identical-prefix
 pub fn solve(parsed_data: String) -> Result<String, Box<dyn Error>> {
     let json_data: ProblemData = serde_json::from_str(&parsed_data)?;
     assert_eq!(json_data.include.len(), 32);

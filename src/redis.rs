@@ -1,3 +1,6 @@
+// https://rdb.fnordig.de/file_format.html
+// https://github.com/redis/redis/blob/4505eb18213c8da31c6dd39ba7cd36d3d01141a5/src/rdb.h
+// https://github.com/redis/redis/blob/4505eb18213c8da31c6dd39ba7cd36d3d01141a5/src/rdb.c
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use regex::Regex;
 use serde_json::json;
